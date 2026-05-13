@@ -7082,6 +7082,9 @@ function iniciarDictado() {
   rec.maxAlternatives = 1;
 
   let lastFinalText = '';
+  let lastProcessedInterim = '';
+  let interimTimer = null;
+  let processingBatch = false;
 
   rec.onstart = () => {
     EVAL_OFT.dictadoActivo = true;
@@ -7091,6 +7094,38 @@ function iniciarDictado() {
     if (transcEl) transcEl.innerHTML = '<span class="dictado-transcript-label">🟢 Escuchando...</span> empieza a dictar';
   };
 
+  // ⚡ Procesa texto INMEDIATAMENTE (sin esperar el "final" de Chrome)
+  function procesarTextoVoz(texto, esFinal) {
+    if (!texto || !texto.trim()) return;
+    const textoLimpio = texto.trim();
+
+    // Guard: si ya procesamos exactamente esto, no repetir
+    // PERO solo bloquear si es el MISMO texto Y la misma marca (interim/final)
+    const claveProceso = (esFinal ? 'F:' : 'I:') + textoLimpio;
+    if (claveProceso === lastProcessedInterim) return;
+    lastProcessedInterim = claveProceso;
+
+    const resultado = parsearDictado(textoLimpio);
+    const acciones = resultado.acciones || [];
+    const textoNorm = resultado.textoNormalizado || '';
+
+    // Actualizar debug (siempre, para feedback inmediato)
+    const debugEl = document.getElementById('dictado-debug');
+    if (debugEl) {
+      debugEl.style.display = 'block';
+      debugEl.innerHTML = `
+        <div><strong>📝 ${esFinal ? '✅ Final' : '⚡ En vivo'}:</strong> "${escapeHtml(textoLimpio)}"</div>
+        <div><strong>🔧 Normalizado:</strong> "${escapeHtml(textoNorm)}"</div>
+        <div><strong>✅ Acciones:</strong> ${acciones.length}</div>
+        ${acciones.length > 0 ? '<div style="margin-top:4px;">' + acciones.map(a => `<code style="background:#FFB300; color:#08284A; padding:2px 6px; margin-right:4px; border-radius:3px; font-size:11px;">${escapeHtml(JSON.stringify(a))}</code>`).join('') + '</div>' : ''}
+      `;
+    }
+
+    if (acciones.length > 0) {
+      aplicarDictado(acciones);
+    }
+  }
+
   rec.onresult = (e) => {
     let interim = '';
     let final = '';
@@ -7099,52 +7134,36 @@ function iniciarDictado() {
       if (e.results[i].isFinal) final += t + ' ';
       else interim += t;
     }
+
+    // ⚡ Actualizar transcript SIEMPRE para feedback inmediato
     const transcEl = document.getElementById('dictado-transcript');
     if (transcEl) {
       const display = (final || interim).trim();
       if (display) {
-        transcEl.innerHTML = '<span class="dictado-transcript-label">🟢 ' + (final ? 'Procesando:' : 'Escuchando:') + '</span> ' + escapeHtml(display);
+        transcEl.innerHTML = '<span class="dictado-transcript-label">🟢 ' + (final ? '✅ Aplicando:' : '⚡ Escuchando:') + '</span> ' + escapeHtml(display);
       }
     }
+
+    // ⚡ Procesar INTERIM si pasa el debounce corto (cada 600ms mientras hablas)
+    if (interim.trim() && !final) {
+      if (interimTimer) clearTimeout(interimTimer);
+      interimTimer = setTimeout(() => {
+        procesarTextoVoz(interim, false);
+      }, 600);
+    }
+
+    // Procesar FINAL inmediato (con guard anti-duplicado)
     if (final.trim() && final.trim() !== lastFinalText) {
+      if (interimTimer) clearTimeout(interimTimer);
       lastFinalText = final.trim();
-      const resultado = parsearDictado(final);
-      const acciones = resultado.acciones || [];
-      const textoNorm = resultado.textoNormalizado || '';
-
-      // Actualizar debug
-      const debugEl = document.getElementById('dictado-debug');
-      if (debugEl) {
-        debugEl.style.display = 'block';
-        debugEl.innerHTML = `
-          <div><strong>📝 Original:</strong> "${escapeHtml(final.trim())}"</div>
-          <div><strong>🔧 Normalizado:</strong> "${escapeHtml(textoNorm)}"</div>
-          <div><strong>✅ Acciones detectadas:</strong> ${acciones.length}</div>
-          ${acciones.length > 0 ? '<div style="margin-top:4px;">' + acciones.map(a => `<code style="background:#FFB300; color:#08284A; padding:2px 6px; margin-right:4px; border-radius:3px; font-size:11px;">${escapeHtml(JSON.stringify(a))}</code>`).join('') + '</div>' : ''}
-        `;
-      }
-
-      if (acciones.length > 0) {
-        aplicarDictado(acciones);
-      } else {
-        // No se reconoció ningún campo. Mostrar pista
-        const indCampo = document.getElementById('dictado-current-field');
-        if (indCampo) {
-          indCampo.style.display = 'inline-block';
-          indCampo.style.background = '#FFA726';
-          indCampo.textContent = '⚠ No reconocí los campos — revisa "🐛 Debug" abajo';
-          setTimeout(() => {
-            indCampo.style.background = 'var(--amber-500)';
-          }, 3500);
-        }
-      }
+      procesarTextoVoz(final, true);
     }
   };
 
   rec.onerror = (e) => {
     console.warn('SpeechRecognition error:', e.error, e.message);
-    if (e.error === 'no-speech') return; // Normal cuando hay silencio
-    if (e.error === 'aborted') return; // Lo abortamos nosotros
+    if (e.error === 'no-speech') return;
+    if (e.error === 'aborted') return;
     if (e.error === 'not-allowed') {
       toast('❌ Permiso al micrófono denegado. Click en 🔒 al lado de la URL para habilitarlo.', 'crit');
       detenerDictado();
@@ -7156,7 +7175,7 @@ function iniciarDictado() {
       return;
     }
     if (e.error === 'network') {
-      toast('⚠ Error de red en reconocimiento de voz. Verifica conexión a internet.', 'warn');
+      toast('⚠ Error de red en reconocimiento de voz.', 'warn');
       return;
     }
     if (e.error === 'service-not-allowed') {
@@ -7164,19 +7183,14 @@ function iniciarDictado() {
       detenerDictado();
       return;
     }
-    console.error('Error dictado no manejado:', e.error);
   };
 
   rec.onend = () => {
-    // Reiniciar automáticamente si seguimos activos (Chrome corta cada cierto tiempo)
+    // ⚡ Reiniciar INMEDIATAMENTE (no 100ms de retraso)
     if (EVAL_OFT.dictadoActivo) {
-      try {
-        setTimeout(() => {
-          if (EVAL_OFT.dictadoActivo) {
-            try { rec.start(); } catch(e) { /* ya iniciado */ }
-          }
-        }, 100);
-      } catch(e) {}
+      lastFinalText = ''; // Reset para nueva sesión
+      lastProcessedInterim = '';
+      try { rec.start(); } catch(e) { /* ya iniciado */ }
     }
   };
 
